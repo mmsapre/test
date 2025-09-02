@@ -1,0 +1,169 @@
+# Airflow 2.x DAG to run:
+# 1) Landing validation (GE Validator + expected-data)
+# 2) Staging/Mastering distribution & column/type checks (single JSON report)
+#
+# Assumes your repository is available on the Airflow worker (mounted or baked into the image),
+# and that the Python env contains:
+#   great_expectations>=1.0, SQLAlchemy>=1.4,<3, psycopg2-binary>=2.9, pandas>=1.5
+#
+# Configure via Airflow Variables (UI → Admin → Variables) or override with DAG params:
+#   - dq_repo_root: absolute path to the repo root (default: /opt/airflow/repo)
+#   - dq_dsn: PostgreSQL SQLAlchemy DSN, e.g. postgresql+psycopg2://user:pwd@host:5432/db
+#   - dq_schema_landing: landing schema (e.g., landing)
+#   - dq_table_landing: landing table (e.g., landing_ordrs)
+#   - dq_suite_path: expectations suite for landing (default: expectations/my_expectations.json)
+#   - dq_expected_json: optional path to expected rows JSON (default empty)
+#   - dq_expected_csv: optional path to expected rows CSV (default empty)
+#   - dq_config_path: config/pipeline_areas.json (for staging/mastering)
+#   - dq_report_dir: where to write reports (default: /opt/airflow/reports)
+#   - dq_load_ids: CSV string of load ids (e.g., "20250901,20250902"); if empty, uses ds_nodash
+#
+# DAG params you can pass per run:
+#   - load_ids_csv: will override dq_load_ids if provided
+#
+# Schedule: daily 06:00 Asia/Kolkata (change to your preference)
+
+from __future__ import annotations
+
+import os
+from datetime import timedelta
+
+import pendulum
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+
+# ---- Timezone & default args ----
+IST = pendulum.timezone("Asia/Kolkata")
+
+default_args = {
+    "owner": "data-eng",
+    "depends_on_past": False,
+    "email_on_failure": True,
+    "email_on_retry": False,
+    "retries": 0,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id="dq_validate_landing_and_areas",
+    description="Run landing GE validation + staging/mastering distribution checks",
+    start_date=pendulum.datetime(2025, 8, 1, 6, 0, tz=IST),
+    schedule_interval="0 6 * * *",   # 06:00 IST daily
+    catchup=False,
+    default_args=default_args,
+    tags=["data-quality", "gx", "postgres"],
+    params={
+        # override these at trigger time if you want
+        "load_ids_csv": "",
+    },
+) as dag:
+
+    # ---- Variables with fallbacks (read at render time) ----
+    # Note: We use Airflow Variable access inside Jinja in the bash_command to allow UI edits
+    #       without redeploying the DAG file.
+    # repo root + paths are all templated below
+
+    # Build the --load-id args list (supports CSV or falls back to ds_nodash)
+    # We expand it in bash to multiple --load-id flags for your script.
+    landing_cmd = r"""
+set -euo pipefail
+
+REPO_ROOT="{{ var.value.dq_repo_root or '/opt/airflow/repo' }}"
+DSN="{{ var.value.dq_dsn }}"
+SCHEMA="{{ var.value.dq_schema_landing or 'landing' }}"
+TABLE="{{ var.value.dq_table_landing or 'landing_ordrs' }}"
+SUITE_PATH="{{ var.value.dq_suite_path or 'expectations/my_expectations.json' }}"
+EXPECTED_JSON="{{ var.value.dq_expected_json or '' }}"
+EXPECTED_CSV="{{ var.value.dq_expected_csv or '' }}"
+
+# load ids: params.load_ids_csv overrides var, else default to ds_nodash (yyyymmdd)
+LOAD_IDS_CSV="{{ params.load_ids_csv or var.value.dq_load_ids or ds_nodash }}"
+LOAD_ARGS=""
+IFS=',' read -ra LIDS <<< "$LOAD_IDS_CSV"
+for lid in "${LIDS[@]}"; do
+  lid_trimmed="$(echo "$lid" | xargs)"
+  if [[ -n "$lid_trimmed" ]]; then
+    LOAD_ARGS+=" --load-id ${lid_trimmed}"
+  fi
+done
+
+cd "$REPO_ROOT"
+
+EXTRA_EXPECTED=""
+if [[ -n "$EXPECTED_JSON" ]]; then
+  EXTRA_EXPECTED+=" --expected-json ${EXPECTED_JSON}"
+fi
+if [[ -n "$EXPECTED_CSV" ]]; then
+  EXTRA_EXPECTED+=" --expected-csv ${EXPECTED_CSV}"
+fi
+
+echo "[INFO] Running landing validation..."
+set -x
+python tools/verify_landing_pg_from_suite.py \
+  --schema "$SCHEMA" \
+  --table "$TABLE" \
+  --dsn "$DSN" \
+  --suite "$SUITE_PATH" \
+  ${EXTRA_EXPECTED} \
+  ${LOAD_ARGS} \
+  --print-summary
+"""
+
+    landing_validation = BashOperator(
+        task_id="landing_validation",
+        bash_command=landing_cmd,
+        append_env=True,
+    )
+
+    areas_cmd = r"""
+set -euo pipefail
+
+REPO_ROOT="{{ var.value.dq_repo_root or '/opt/airflow/repo' }}"
+DSN="{{ var.value.dq_dsn }}"
+CONFIG_PATH="{{ var.value.dq_config_path or 'config/pipeline_areas.json' }}"
+REPORT_DIR="{{ var.value.dq_report_dir or '/opt/airflow/reports' }}"
+
+# Ensure report directory exists
+mkdir -p "$REPORT_DIR"
+
+# Report file names per run
+RUN_STAMP="{{ ds_nodash }}"
+REPORT_JSON="${REPORT_DIR}/distribution_report_${RUN_STAMP}.json"
+MISSING_CSV="${REPORT_DIR}/missing_keys_${RUN_STAMP}.csv"
+
+# load ids: params.load_ids_csv overrides var, else default to ds_nodash (yyyymmdd)
+LOAD_IDS_CSV="{{ params.load_ids_csv or var.value.dq_load_ids or ds_nodash }}"
+LOAD_ARGS=""
+IFS=',' read -ra LIDS <<< "$LOAD_IDS_CSV"
+for lid in "${LIDS[@]}"; do
+  lid_trimmed="$(echo "$lid" | xargs)"
+  if [[ -n "$lid_trimmed" ]]; then
+    LOAD_ARGS+=" --load-id ${lid_trimmed}"
+  fi
+done
+
+cd "$REPO_ROOT"
+
+echo "[INFO] Running staging/mastering distribution checks..."
+set -x
+python tools/verify_areas_and_distribution.py \
+  --dsn "$DSN" \
+  --config "$CONFIG_PATH" \
+  ${LOAD_ARGS} \
+  --report-json "$REPORT_JSON" \
+  --missing-keys-csv "$MISSING_CSV" \
+  --print-summary
+
+echo "[INFO] Report paths:"
+echo " - ${REPORT_JSON}"
+echo " - ${MISSING_CSV}"
+"""
+
+    areas_validation = BashOperator(
+        task_id="staging_mastering_distribution",
+        bash_command=areas_cmd,
+        append_env=True,
+    )
+
+    # Order: Landing first, then staging/mastering (so suite/landing issues show up early)
+    landing_validation >> areas_validation
