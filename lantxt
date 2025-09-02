@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+import great_expectations as gx
+
+
+# -------------------- CLI --------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Verify a Postgres landing table using a GE (Validator) suite + expected-data checks (supports multiple load_id)."
+    )
+    p.add_argument("--schema", required=True, help="Postgres schema (e.g., landing)")
+    p.add_argument("--table", required=True, help="Table name (e.g., landing_ordrs)")
+    p.add_argument(
+        "--dsn",
+        required=True,
+        help="SQLAlchemy DSN, e.g. postgresql+psycopg2://user:pwd@host:5432/db",
+    )
+    p.add_argument(
+        "--suite",
+        default="expectations/my_expectations.json",
+        help="Path to GE suite JSON (default: expectations/my_expectations.json)",
+    )
+    # Expected-data sources (optional; can also live inside the suite)
+    p.add_argument(
+        "--expected-csv",
+        default=None,
+        help="CSV with expected rows; columns are filter fields, optional 'expected_count' column.",
+    )
+    p.add_argument(
+        "--expected-json",
+        default=None,
+        help="JSON with {rows:[...], key_columns:[...]} or a raw array of row objects.",
+    )
+    p.add_argument(
+        "--key-cols",
+        default=None,
+        help="Comma-separated key columns for grouping/uniqueness (overrides suite/file).",
+    )
+    p.add_argument(
+        "--default-min-count",
+        type=int,
+        default=1,
+        help="Default minimum count per expected row when 'expected_count' is not provided.",
+    )
+    # multiple load ids (repeatable and/or comma-separated)
+    p.add_argument(
+        "--load-id",
+        dest="load_ids",
+        action="append",
+        default=[],
+        help="Filter to this/these load_id(s). Repeatable. Also accepts comma-separated list (e.g., --load-id 20250901,20250902).",
+    )
+    p.add_argument(
+        "--print-summary",
+        action="store_true",
+        help="Print RESULT: PASS/FAIL at the end.",
+    )
+    return p.parse_args()
+
+
+# -------------------- I/O helpers --------------------
+
+def load_suite_json(path: str | Path) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        fail(f"Expectation suite not found: {p}")
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        fail(f"Invalid JSON in suite '{p}': {e}")
+    return {}  # unreachable
+
+
+def read_expected_from_csv(csv_path: str) -> Tuple[List[Dict[str, Any]], Optional[List[str]]]:
+    df = pd.read_csv(csv_path)
+    rows: List[Dict[str, Any]] = df.to_dict(orient="records")
+    key_cols = None
+    return rows, key_cols
+
+
+def read_expected_from_json(json_path: str) -> Tuple[List[Dict[str, Any]], Optional[List[str]]]:
+    obj = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    if isinstance(obj, list):
+        return obj, None
+    elif isinstance(obj, dict):
+        rows = obj.get("rows", [])
+        key_cols = obj.get("key_columns") or obj.get("keyCols") or None
+        if not isinstance(rows, list):
+            fail(f"Invalid JSON: 'rows' must be an array in {json_path}")
+        return rows, key_cols
+    else:
+        fail(f"Invalid expected JSON shape in {json_path}")
+    return [], None
+
+
+def expected_from_suite(suite: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[List[str]]]:
+    ed = suite.get("expected_data")
+    if not ed:
+        return [], None
+    rows = ed.get("rows") or []
+    key_cols = ed.get("key_columns") or None
+    if not isinstance(rows, list):
+        fail("Suite.expected_data.rows must be an array.")
+    return rows, key_cols
+
+
+# -------------------- GE Validator helpers --------------------
+
+def get_validator(dsn: str, schema: str, table: str, suite_name: str = "tmp_suite") -> gx.Validator:
+    """
+    Build a Validator for a SQL table using GX 1.x APIs.
+    """
+    context = gx.get_context()  # creates/uses ./great_expectations locally
+    # Add or reuse SQL datasource
+    try:
+        ds = context.sources.add_sql(name="pg_src", connection_string=dsn)
+    except Exception:
+        # likely already exists; try to fetch by name
+        ds = context.sources.get("pg_src")  # type: ignore[attr-defined]
+
+    asset_name = f"{schema}_{table}"
+    try:
+        asset = ds.add_table_asset(name=asset_name, table_name=table, schema_name=schema)
+    except Exception:
+        # likely exists; try get
+        asset = ds.get_asset(asset_name)  # type: ignore[attr-defined]
+
+    batch_request = asset.build_batch_request()
+    suite = context.add_or_update_expectation_suite(name=suite_name)
+    v = context.get_validator(batch_request=batch_request, expectation_suite=suite)
+    return v
+
+
+def apply_suite_to_validator(v: gx.Validator, suite: Dict[str, Any], row_condition_sql: Optional[str]) -> List[str]:
+    """
+    For each expectation in the JSON suite, call the corresponding Validator method.
+    Inject a row_condition (and condition_parser='sqlalchemy') if provided.
+    Returns a list of warnings.
+    """
+    warnings: List[str] = []
+    exps = (suite or {}).get("expectations", [])
+    for idx, exp in enumerate(exps, start=1):
+        etype = exp.get("expectation_type")
+        kwargs = (exp.get("kwargs") or {}).copy()
+        if not etype:
+            warnings.append(f"[warn] expectation #{idx} missing 'expectation_type'")
+            continue
+
+        # strip noise
+        for noisy in ("meta", "notes"):
+            kwargs.pop(noisy, None)
+
+        # inject condition for GX 1.x (applies per-expectation)
+        if row_condition_sql:
+            # only add if not already set in the suite
+            kwargs.setdefault("row_condition", row_condition_sql)
+            kwargs.setdefault("condition_parser", "sqlalchemy")
+
+        meth = getattr(v, etype, None)
+        if meth is None or not callable(meth):
+            warnings.append(f"[warn] Unknown/unsupported GE expectation: {etype} (skipped)")
+            continue
+
+        try:
+            meth(**kwargs)
+        except TypeError as te:
+            warnings.append(f"[warn] {etype} incompatible kwargs {kwargs}: {te}")
+        except Exception as e:
+            warnings.append(f"[warn] {etype} raised {type(e).__name__}: {e}")
+
+    return warnings
+
+
+def validation_result_to_dict(res: Any) -> Dict[str, Any]:
+    # GX 1.x returns an ExpectationSuiteValidationResult object; try to serialize
+    try:
+        return res.to_json_dict()  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            return dict(res)  # type: ignore[arg-type]
+        except Exception:
+            return {"result_repr": repr(res)}
+
+
+# -------------------- Expected Data checks (SQL) --------------------
+
+def normalize_expected_rows(rows: List[Dict[str, Any]], default_min_count: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rc = dict(r)
+        expc = rc.get("expected_count")
+        if expc is None or (isinstance(expc, str) and not str(expc).strip()):
+            rc["expected_count"] = int(default_min_count)
+        else:
+            rc["expected_count"] = int(expc)
+        out.append(rc)
+    return out
+
+
+def build_in_clause(col: str, values: List[Any], param_prefix: str) -> Tuple[str, Dict[str, Any]]:
+    params = {}
+    placeholders = []
+    for i, v in enumerate(values):
+        key = f"{param_prefix}{i}"
+        placeholders.append(f":{key}")
+        params[key] = v
+    if not placeholders:
+        return "1=0", {}
+    return f"{col} IN ({', '.join(placeholders)})", params
+
+
+def build_where_and_params(row: Dict[str, Any], global_in: Dict[str, List[Any]]) -> Tuple[str, Dict[str, Any]]:
+    params: Dict[str, Any] = {}
+    parts: List[str] = []
+
+    # row-level equality predicates
+    for k, v in row.items():
+        if k == "expected_count":
+            continue
+        parts.append(f"{k} = :{k}")
+        params[k] = v
+
+    # global IN filters (e.g., load_id)
+    for k, vals in global_in.items():
+        clause, p = build_in_clause(k, vals, f"__{k}_")
+        parts.append(clause)
+        params.update(p)
+
+    return " AND ".join(parts) if parts else "1=1", params
+
+
+def check_expected_rows(
+    engine: Engine,
+    schema: str,
+    table: str,
+    rows: List[Dict[str, Any]],
+    global_in: Dict[str, List[Any]],
+) -> List[str]:
+    failures: List[str] = []
+    with engine.connect() as conn:
+        for r in rows:
+            where_sql, params = build_where_and_params(r, global_in)
+            expc = int(r.get("expected_count", 1))
+            q = text(f'SELECT COUNT(*) AS c FROM "{schema}"."{table}" WHERE {where_sql}')
+            try:
+                cnt = int(conn.execute(q, params).scalar() or 0)
+            except Exception as e:
+                failures.append(f"Expected-data query failed for {r}: {e}")
+                continue
+
+            if cnt < expc:
+                failures.append(
+                    f"Missing/insufficient rows for {r} with globals in={global_in}: found {cnt}, expected >= {expc}"
+                )
+    return failures
+
+
+# -------------------- flow & plumbing --------------------
+
+def parse_load_ids(raw: List[str]) -> List[int]:
+    out: List[int] = []
+    for item in raw:
+        for tok in str(item).split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                out.append(int(tok))
+            except ValueError:
+                fail(f"--load-id must be integer(s); got '{tok}'")
+    # de-duplicate, preserve order
+    seen = set()
+    dedup: List[int] = []
+    for v in out:
+        if v not in seen:
+            seen.add(v)
+            dedup.append(v)
+    return dedup
+
+
+def fail(msg: str) -> None:
+    print(f"[FAIL] {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def ok(msg: str) -> None:
+    print(f"[OK] {msg}")
+
+
+def main() -> None:
+    args = parse_args()
+    load_ids: List[int] = parse_load_ids(args.load_ids)
+
+    # 1) Load suite
+    suite = load_suite_json(args.suite)
+
+    # 2) Connect SQLAlchemy for expected-data checks
+    try:
+        engine = create_engine(args.dsn)
+    except Exception as e:
+        fail(f"Could not create engine: {e}")
+
+    # 3) GE Validator for landing table
+    suite_name = f"{args.schema}.{args.table}_suite"
+    v = get_validator(args.dsn, args.schema, args.table, suite_name=suite_name)
+    row_condition_sql = None
+    if load_ids:
+        in_list = ", ".join(str(vv) for vv in load_ids)
+        row_condition_sql = f"load_id IN ({in_list})"
+
+    warnings = apply_suite_to_validator(v, suite, row_condition_sql)
+    for w in warnings:
+        print(w, file=sys.stderr)
+
+    try:
+        ge_res_obj = v.validate()
+    except Exception as e:
+        fail(f"Validation run failed: {e}")
+
+    ge_res = validation_result_to_dict(ge_res_obj)
+    ge_success = bool(ge_res.get("success", False))
+    print(ge_res)
+
+    if not ge_success:
+        print("[FAIL] Great Expectations validation failed.", file=sys.stderr)
+
+    # 4) Load expected rows (priority: CLI files > suite)
+    expected_rows: List[Dict[str, Any]] = []
+    key_cols: Optional[List[str]] = None
+
+    if args.expected_csv:
+        r, kc = read_expected_from_csv(args.expected_csv)
+        expected_rows.extend(r)
+        key_cols = kc or key_cols
+
+    if args.expected_json:
+        r, kc = read_expected_from_json(args.expected_json)
+        expected_rows.extend(r)
+        key_cols = kc or key_cols
+
+    if not expected_rows:
+        r, kc = expected_from_suite(suite)
+        expected_rows.extend(r)
+        key_cols = kc or key_cols
+
+    # 5) Normalize and run expected-data presence checks
+    ed_failures: List[str] = []
+    global_in: Dict[str, List[Any]] = {}
+    if load_ids:
+        global_in["load_id"] = load_ids  # IN filter for expected-data queries too
+
+    if expected_rows:
+        expected_rows = normalize_expected_rows(expected_rows, args.default_min_count)
+        ed_failures = check_expected_rows(
+            engine, args.schema, args.table, expected_rows, global_in
+        )
+        if ed_failures:
+            for f in ed_failures:
+                print(f"[FAIL] {f}", file=sys.stderr)
+        else:
+            scope = f"(load_id IN {tuple(load_ids)}) " if load_ids else ""
+            ok(f"Expected-data presence check passed {scope}for {len(expected_rows)} predicate(s).")
+    else:
+        print("[info] No expected-data rows provided (suite/CLI). Skipping expected-data checks.")
+
+    # 6) Final status
+    overall_success = ge_success and not ed_failures
+    if overall_success:
+        scope = f"{args.schema}.{args.table}"
+        if load_ids:
+            scope += f" [load_id IN {tuple(load_ids)}]"
+        ok(f"All checks passed for {scope}")
+        if args.print_summary:
+            print("RESULT: PASS")
+        sys.exit(0)
+    else:
+        if args.print_summary:
+            print("RESULT: FAIL", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
