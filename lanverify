@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, json, sys, csv
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+import great_expectations as gx
+
+
+# ------------- CLI -------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+      description="Validate landing (GE Validator) + staging/mastering (columns/types/distribution) and emit a single JSON report."
+    )
+    p.add_argument("--dsn", required=True,
+                   help="SQLAlchemy DSN (postgresql+psycopg2://user:pwd@host:5432/db)")
+    p.add_argument("--config", default="config/pipeline_areas.json",
+                   help="Pipeline config JSON (default: config/pipeline_areas.json)")
+    p.add_argument("--load-id", dest="load_ids", action="append", default=[],
+                   help="Repeatable and/or comma-separated load IDs to filter all checks.")
+    p.add_argument("--report-json", default="distribution_report.json",
+                   help="Path for extended JSON report (default: distribution_report.json)")
+    p.add_argument("--missing-keys-csv", default=None,
+                   help="Optional path to write missing keys as CSV (union of all areas).")
+    p.add_argument("--print-summary", action="store_true",
+                   help="Print RESULT: PASS/FAIL at the end.")
+    return p.parse_args()
+
+
+# ------------- Utils -------------
+
+def fail(msg: str) -> None:
+    print(f"[FAIL] {msg}", file=sys.stderr); sys.exit(2)
+
+def warn(msg: str) -> None:
+    print(f"[warn] {msg}", file=sys.stderr)
+
+def ok(msg: str) -> None:
+    print(f"[OK] {msg}")
+
+def parse_load_ids(raw: List[str]) -> List[int]:
+    out: List[int] = []
+    for item in raw:
+        for tok in str(item).split(","):
+            tok = tok.strip()
+            if not tok: continue
+            try: out.append(int(tok))
+            except ValueError: fail(f"--load-id must be integer(s); got '{tok}'")
+    seen, dedup = set(), []
+    for v in out:
+        if v not in seen:
+            seen.add(v); dedup.append(v)
+    return dedup
+
+def read_json(path: str | Path) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists(): fail(f"Config not found: {p}")
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        fail(f"Invalid JSON in {p}: {e}")
+    return {}
+
+def table_exists(engine: Engine, schema: str, table: str) -> bool:
+    q = text("""SELECT 1 FROM information_schema.tables
+                WHERE table_schema=:s AND table_name=:t""")
+    with engine.connect() as c:
+        return c.execute(q, {"s": schema, "t": table}).fetchone() is not None
+
+def get_columns_and_types(engine: Engine, schema: str, table: str) -> Dict[str, str]:
+    q = text("""SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema=:s AND table_name=:t""")
+    with engine.connect() as c:
+        rows = c.execute(q, {"s": schema, "t": table}).fetchall()
+    return {r[0]: str(r[1]).lower() for r in rows}
+
+def safe_in_clause(col: str, values: List[Any], prefix: str) -> Tuple[str, Dict[str, Any]]:
+    params, ph = {}, []
+    for i, v in enumerate(values):
+        key = f"{prefix}{i}"; params[key] = v; ph.append(f":{key}")
+    return (f"{col} IN ({', '.join(ph)})", params) if ph else ("1=0", {})
+
+def fetch_keys(engine: Engine, schema: str, table: str, key_cols: List[str],
+               load_ids: List[int], extra_where: Optional[str] = None) -> Set[Tuple]:
+    parts, params = [], {}
+    if load_ids:
+        clause, ip = safe_in_clause("load_id", load_ids, "__ld_")
+        parts.append(clause); params.update(ip)
+    if extra_where and extra_where.strip():
+        parts.append(f"({extra_where})")
+    where_sql = " WHERE " + " AND ".join(parts) if parts else ""
+    cols_sql = ", ".join([f'"{c}"' for c in key_cols])
+    q = text(f'SELECT {cols_sql} FROM "{schema}"."{table}"{where_sql}')
+    with engine.connect() as c:
+        rows = c.execute(q, params).fetchall()
+    return set(tuple(r) for r in rows)
+
+def fetch_count(engine: Engine, schema: str, table: str,
+                load_ids: List[int], extra_where: Optional[str] = None) -> int:
+    parts, params = [], {}
+    if load_ids:
+        clause, ip = safe_in_clause("load_id", load_ids, "__ld_")
+        parts.append(clause); params.update(ip)
+    if extra_where and extra_where.strip():
+        parts.append(f"({extra_where})")
+    where_sql = " WHERE " + " AND ".join(parts) if parts else ""
+    q = text(f'SELECT COUNT(*) FROM "{schema}"."{table}"{where_sql}')
+    with engine.connect() as c:
+        return int(c.execute(q, params).scalar() or 0)
+
+
+# ------------- GE Validator for landing -------------
+
+def get_validator(dsn: str, schema: str, table: str, suite_name: str) -> gx.Validator:
+    context = gx.get_context()
+    try:
+        ds = context.sources.add_sql(name="pg_src", connection_string=dsn)
+    except Exception:
+        ds = context.sources.get("pg_src")  # type: ignore[attr-defined]
+
+    asset_name = f"{schema}_{table}"
+    try:
+        asset = ds.add_table_asset(name=asset_name, table_name=table, schema_name=schema)
+    except Exception:
+        asset = ds.get_asset(asset_name)  # type: ignore[attr-defined]
+
+    br = asset.build_batch_request()
+    suite = context.add_or_update_expectation_suite(name=suite_name)
+    return context.get_validator(batch_request=br, expectation_suite=suite)
+
+
+def apply_suite_to_validator(v: gx.Validator, suite: Dict[str, Any], row_condition_sql: Optional[str]) -> List[str]:
+    warnings: List[str] = []
+    exps = (suite or {}).get("expectations", [])
+    for idx, exp in enumerate(exps, start=1):
+        etype = exp.get("expectation_type")
+        kwargs = (exp.get("kwargs") or {}).copy()
+        if not etype:
+            warnings.append(f"[warn] expectation #{idx} missing 'expectation_type'")
+            continue
+        for noisy in ("meta", "notes"):
+            kwargs.pop(noisy, None)
+        if row_condition_sql:
+            kwargs.setdefault("row_condition", row_condition_sql)
+            kwargs.setdefault("condition_parser", "sqlalchemy")
+        meth = getattr(v, etype, None)
+        if meth is None or not callable(meth):
+            warnings.append(f"[warn] Unknown/unsupported GE expectation: {etype} (skipped)")
+            continue
+        try:
+            meth(**kwargs)
+        except TypeError as te:
+            warnings.append(f"[warn] {etype} incompatible kwargs {kwargs}: {te}")
+        except Exception as e:
+            warnings.append(f"[warn] {etype} raised {type(e).__name__}: {e}")
+    return warnings
+
+
+def validation_result_to_dict(res: Any) -> Dict[str, Any]:
+    try:
+        return res.to_json_dict()  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            return dict(res)  # type: ignore[arg-type]
+        except Exception:
+            return {"result_repr": repr(res)}
+
+
+def run_ge_on_landing_with_validator(engine: Engine, landing: Dict[str, Any],
+                                     suite_path: Optional[str], load_ids: List[int]) -> Dict[str, Any]:
+    schema, table = landing["schema"], landing["table"]
+    result = {"schema": schema, "table": table, "suite": suite_path, "success": None, "ge_summary": None}
+    try:
+        v = get_validator(str(engine.url), schema, table, suite_name=f"{schema}.{table}_suite")
+        row_condition_sql = None
+        if load_ids:
+            row_condition_sql = f"load_id IN ({', '.join(str(i) for i in load_ids)})"
+        if suite_path:
+            suite = json.loads(Path(suite_path).read_text(encoding="utf-8"))
+            warnings = apply_suite_to_validator(v, suite, row_condition_sql)
+            if warnings:
+                result["warnings"] = warnings
+            ge_res_obj = v.validate()
+            ge_res = validation_result_to_dict(ge_res_obj)
+            result["success"] = bool(ge_res.get("success", False))
+            result["ge_summary"] = ge_res
+        else:
+            result["success"] = True
+            result["ge_summary"] = {"info": "No suite provided; GE skipped."}
+    except Exception as e:
+        result["success"] = False
+        result["error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
+# ------------- Area checks (columns/types/counts/distribution) -------------
+
+def verify_area(engine: Engine, area_name: str, area_cfg: Dict[str, Any],
+                landing_cfg: Dict[str, Any], key_cols: List[str],
+                load_ids: List[int], report: Dict[str, Any]) -> Tuple[List[str], Dict[str, List[Tuple]]]:
+    failures: List[str] = []
+    exact_columns = bool(area_cfg.get("exact_columns", True))
+    tables: List[Dict[str, Any]] = area_cfg.get("tables", [])
+
+    area_section: Dict[str, Any] = {"tables": []}
+    report[area_name] = area_section
+
+    # Build landing key universe within scope
+    landing_keys = fetch_keys(engine, landing_cfg["schema"], landing_cfg["table"], key_cols, load_ids, None)
+
+    # Per-table checks
+    per_table_missing_keys: Dict[str, List[Tuple]] = {}
+    for t in tables:
+        schema, table = t["schema"], t["table"]
+        where = t.get("where")
+        expected_cols = t.get("expected_columns", [])
+        expected_types = {k.lower(): v.lower() for k, v in (t.get("expected_types", {}) or {}).items()}
+        min_count = t.get("min_count"); max_count = t.get("max_count")
+
+        item: Dict[str, Any] = {"schema": schema, "table": table}
+        area_section["tables"].append(item)
+
+        # existence
+        exists = table_exists(engine, schema, table)
+        item["exists"] = exists
+        if not exists:
+            failures.append(f"{area_name}: {schema}.{table} does not exist")
+            continue
+
+        # columns/types
+        actual = get_columns_and_types(engine, schema, table)
+        actual_cols = list(actual.keys())
+        item["actual_columns"] = actual_cols
+
+        if expected_cols:
+            missing = [c for c in expected_cols if c not in actual]
+            extra = [c for c in actual if c not in expected_cols]
+            item["missing_columns"] = missing
+            item["extra_columns"] = extra
+            if missing:
+                failures.append(f"{area_name}: {schema}.{table} missing columns: {', '.join(missing)}")
+            if exact_columns and extra:
+                failures.append(f"{area_name}: {schema}.{table} has extra columns: {', '.join(extra)}")
+
+        if expected_types:
+            type_mismatches = []
+            for col, want in expected_types.items():
+                got = actual.get(col)
+                if not got:
+                    type_mismatches.append(f"{col}: expected {want}, got <missing>")
+                else:
+                    if not got.startswith(want):
+                        type_mismatches.append(f"{col}: expected {want}, got {got}")
+            item["type_mismatches"] = type_mismatches
+            if type_mismatches:
+                failures.append(f"{area_name}: {schema}.{table} type mismatches -> {', '.join(type_mismatches)}")
+
+        # counts
+        scoped_count = fetch_count(engine, schema, table, load_ids, None)
+        item["scoped_count"] = scoped_count
+        if min_count is not None and scoped_count < int(min_count):
+            failures.append(f"{area_name}: {schema}.{table} count {scoped_count} < min_count {min_count}")
+        if max_count is not None and scoped_count > int(max_count):
+            failures.append(f"{area_name}: {schema}.{table} count {scoped_count} > max_count {max_count}")
+
+        # expected routing subset (if where is given)
+        table_keys = fetch_keys(engine, schema, table, key_cols, load_ids, None)
+        if where:
+            expected_subset = fetch_keys(engine, landing_cfg["schema"], landing_cfg["table"], key_cols, load_ids, where)
+            missing_subset = sorted(list(expected_subset - table_keys))[:100]
+            item["routing_where"] = where
+            item["expected_subset_count"] = len(expected_subset)
+            item["missing_from_table_count"] = len(expected_subset - table_keys)
+            if missing_subset:
+                failures.append(f"{area_name}: {schema}.{table} missing {len(expected_subset - table_keys)} routed key(s)")
+                per_table_missing_keys[f"{schema}.{table}"] = missing_subset
+        item["key_count"] = len(table_keys)
+
+    # If NO table has a routing rule, ensure every landing key appears in at least one table
+    if not any(t.get("where") for t in tables) and tables:
+        union: Set[Tuple] = set()
+        for t in tables:
+            schema, table = t["schema"], t["table"]
+            if not table_exists(engine, schema, table):
+                continue
+            union |= fetch_keys(engine, schema, table, key_cols, load_ids, None)
+        missing = sorted(list(landing_keys - union))[:200]
+        area_section["union_key_count"] = len(union)
+        area_section["landing_key_count"] = len(landing_keys)
+        area_section["missing_from_area_count"] = len(landing_keys - union)
+        if missing:
+            failures.append(f"{area_name}: {len(landing_keys - union)} landing key(s) missing across all tables")
+            per_table_missing_keys[f"{area_name}::MISSING_ACROSS_AREA"] = missing
+
+    if per_table_missing_keys:
+        area_section["missing_key_examples"] = {k: v for k, v in per_table_missing_keys.items()}
+
+    return failures, per_table_missing_keys
+
+
+# ------------- Main -------------
+
+def main() -> None:
+    args = parse_args()
+    load_ids = parse_load_ids(args.load_ids)
+    cfg = read_json(args.config)
+
+    landing = cfg.get("landing") or fail("Config missing 'landing'")
+    key_cols: List[str] = cfg.get("key_columns") or fail("Config missing 'key_columns'")
+    staging_cfg = cfg.get("staging") or {}
+    mastering_cfg = cfg.get("mastering") or {}
+
+    try:
+        engine = create_engine(args.dsn)
+    except Exception as e:
+        fail(f"Cannot create engine: {e}")
+
+    report: Dict[str, Any] = {"scope": {"load_ids": load_ids, "key_columns": key_cols}, "landing": {}, "staging": {}, "mastering": {}, "summary": {}}
+    failures: List[str] = []
+    csv_missing_rows: List[List[Any]] = []
+
+    # Landing GE via Validator
+    landing_suite = landing.get("suite")
+    ge_res = run_ge_on_landing_with_validator(engine, landing, landing_suite, load_ids)
+    report["landing"]["ge"] = ge_res
+    if not ge_res.get("success", False):
+        failures.append("landing: Great Expectations (Validator) failed.")
+
+    # Staging
+    stg_failures, stg_missing = verify_area(engine, "staging", staging_cfg, landing, key_cols, load_ids, report)
+    failures += stg_failures
+
+    # Mastering
+    mst_failures, mst_missing = verify_area(engine, "mastering", mastering_cfg, landing, key_cols, load_ids, report)
+    failures += mst_failures
+
+    # Optional CSV of missing keys (union)
+    if args.missing_keys_csv:
+        headers = ["area_or_table"] + key_cols
+        rows = []
+        for owner, sample in {**stg_missing, **mst_missing}.items():
+            for tup in sample:
+                rows.append([owner, *tup])
+        if rows:
+            with open(args.missing_keys_csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(headers)
+                w.writerows(rows)
+            report["summary"]["missing_keys_csv"] = args.missing_keys_csv
+
+    # Summary & write
+    report["summary"]["failures"] = len(failures)
+    report["summary"]["messages"] = failures
+
+    Path(args.report_json).write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+
+    if failures:
+        for f in failures: print(f"[FAIL] {f}", file=sys.stderr)
+        if args.print_summary: print("RESULT: FAIL", file=sys.stderr)
+        sys.exit(2)
+    else:
+        ok("Landing + Staging/Mastering checks passed.")
+        if args.print_summary: print("RESULT: PASS")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
